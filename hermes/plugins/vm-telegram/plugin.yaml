@@ -1,0 +1,4 @@
+name: vm-telegram
+version: "0.1.0"
+description: "JARVIS's reply buttons on Telegram: a ```buttons block in a reply (the same JSON the control panel reads) becomes inline buttons under that message, and a tap reaches JARVIS as the owner's reply."
+author: "vm-agent"

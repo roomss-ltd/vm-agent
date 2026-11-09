@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""feature: one git branch per thread (feature), a worktree per agent on its team, one squashed commit into stage.
+
+  feature start <repo> <id> <role>...      feature/<id> from origin/stage (or the default branch), its own worktree
+                                           (<root>/<id>/feature: test and run it there) and one per role
+                                           (<root>/<id>/<role>, branch feature/<id>--<role>)
+  feature sync  <repo> <id> <role>         bring feature/<id> into a role's branch (the others' merged work)
+  feature merge <repo> <id> <role>         merge a role's committed work into feature/<id>; a conflict is undone and reported
+  feature status <repo> <id>               the branches, worktrees and commits ahead of stage
+  feature ship  <repo> <id> <message-file> --owner-approved
+                                           squash feature/<id> into stage as ONE commit with that message, push stage,
+                                           remove the worktrees and branches. Only after the owner said yes.
+
+The message file is the changelog a person reads: a subject line, then these sections, in plain words:
+  ## What changed        what someone using it notices
+  ## Why                 the problem it solves, the owner's ask
+  ## How it was tested   what was run and what it showed
+  ## Technical notes     what a developer needs: files, migrations, flags, follow-ups
+Worktrees live under ~/worktrees (FEATURE_ROOT overrides).
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.expanduser(os.environ.get("FEATURE_ROOT", "~/worktrees"))
+SECTIONS = ["What changed", "Why", "How it was tested", "Technical notes"]
+SAFE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+class Fail(Exception):
+    """A refusal with a message for the person or agent running the command (printed after "feature: ", exit 1)."""
+
+
+def git(repo, *args, check=True):
+    """Run `git -C repo args` and return its stripped stdout; with check, a non-zero exit raises Fail."""
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise Fail(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()[-800:]}")
+    return r.stdout.strip()
+
+
+def has(repo, ref):
+    """True when ref resolves in repo."""
+    return subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", ref], capture_output=True).returncode == 0
+
+
+def base(repo):
+    """The ref a feature branches from: origin/stage, else stage, else the remote's default branch, else HEAD."""
+    git(repo, "fetch", "-q", "origin", check=False)  # the local stage may be behind
+    for ref in ("origin/stage", "stage"):
+        if has(repo, ref):
+            return ref
+    head = git(repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", check=False)
+    return head or "HEAD"
+
+
+def stage_ref(repo):
+    """The stage branch to ship onto (origin/stage preferred), or None when the repo has none."""
+    return "origin/stage" if has(repo, "origin/stage") else "stage" if has(repo, "stage") else None
+
+
+def where(id_, name):
+    """The worktree folder of a feature's `name` ("feature" or a role): ROOT/<id>/<name>."""
+    return os.path.join(ROOT, id_, name)
+
+
+def worktree(repo, path, branch, start=None):
+    """Make sure a worktree of `branch` exists at path (creating the branch from `start` when it is new); returns path."""
+    if os.path.isdir(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if has(repo, f"refs/heads/{branch}"):
+        git(repo, "worktree", "add", "-q", path, branch)
+    else:
+        git(repo, "worktree", "add", "-q", "-b", branch, path, start)
+    return path
+
+
+def check_message(text):
+    """Refuse a changelog that lacks a subject line or any of the SECTIONS, or has an empty section."""
+    lines = text.strip().splitlines()
+    if not lines or lines[0].lstrip().startswith("#") or len(lines[0].strip()) < 10:
+        raise Fail("the message must start with a subject line (what this does, in plain words), then the sections")
+    missing = [s for s in SECTIONS if not re.search(rf"^#*\s*{re.escape(s)}\s*:?\s*$", text, re.M | re.I)]
+    if missing:
+        raise Fail("the changelog is missing: " + ", ".join(missing) + ". Sections: " + " / ".join("## " + s for s in SECTIONS))
+    for s in SECTIONS:  # each one says something
+        body = re.split(rf"^#*\s*{re.escape(s)}\s*:?\s*$", text, flags=re.M | re.I)[1]
+        body = re.split(r"^#+\s*\S", body, flags=re.M)[0]
+        if len(body.strip()) < 10:
+            raise Fail(f"the section '{s}' is empty: say it in plain words")
+
+
+def start(repo, id_, roles):
+    """Create feature/<id> and a worktree for it and for each role; returns a summary of the branches and folders."""
+    if not roles:
+        raise Fail("name at least one role (researcher, planner, implementer, tester, deployer, …)")
+    b = base(repo)
+    feat = f"feature/{id_}"
+    if not has(repo, f"refs/heads/{feat}"):
+        git(repo, "branch", feat, b)
+    out = [f"branch {feat} (from {b})", f"  feature: {worktree(repo, where(id_, 'feature'), feat)}"]
+    for role in roles:
+        if not SAFE.match(role) or role == "feature":
+            raise Fail(f"a role is a short lowercase name: {role!r}")
+        out.append(f"  {role}: {worktree(repo, where(id_, role), f'{feat}--{role}', feat)}  (branch {feat}--{role})")
+    return "\n".join(out)
+
+
+def sync(repo, id_, role):
+    """Merge feature/<id> into a role's branch; a conflict is aborted (nothing changes) and reported."""
+    path = where(id_, role)
+    r = subprocess.run(["git", "-C", path, "merge", "--no-edit", f"feature/{id_}"], capture_output=True, text=True)
+    if r.returncode != 0:
+        git(path, "merge", "--abort", check=False)
+        raise Fail(f"feature/{id_} doesn't merge cleanly into {role}'s branch (undone): {r.stdout.strip()[-600:]}")
+    return f"{role} is up to date with feature/{id_}"
+
+
+def merge(repo, id_, role):
+    """Merge a role's committed work into feature/<id> (no fast-forward); a conflict is aborted and reported."""
+    path, feat = where(id_, "feature"), f"feature/{id_}"
+    if git(where(id_, role), "status", "--porcelain"):
+        raise Fail(f"{role} has uncommitted changes in {where(id_, role)}: commit them first")
+    if git(path, "status", "--porcelain"):
+        raise Fail(f"the feature worktree {path} has uncommitted changes: commit or clean them first")
+    r = subprocess.run(["git", "-C", path, "merge", "--no-ff", "-m", f"Merge {role}'s work into {feat}", f"{feat}--{role}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        conflicts = git(path, "diff", "--name-only", "--diff-filter=U", check=False)
+        git(path, "merge", "--abort", check=False)
+        raise Fail(f"{role}'s work conflicts with {feat} (undone). Files: {conflicts or r.stdout.strip()[-400:]}. "
+                   f"Have {role} run `feature sync`, resolve, commit, and merge again.")
+    return f"merged {role} into {feat}: " + git(path, "log", "--oneline", "-1")
+
+
+def status(repo, id_):
+    """A feature's commits ahead of stage and its worktrees (flagging uncommitted changes)."""
+    feat, st = f"feature/{id_}", stage_ref(repo) or "HEAD"
+    out = [f"{feat}: {git(repo, 'rev-list', '--count', f'{st}..{feat}', check=False) or '?'} commits ahead of {st}"]
+    for line in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
+        if f"{os.sep}{id_}{os.sep}" in line or line.split("\n")[0].endswith(f"{os.sep}{id_}"):
+            path = line.split("\n")[0].removeprefix("worktree ")
+            br = next((x.removeprefix("branch refs/heads/") for x in line.split("\n") if x.startswith("branch ")), "?")
+            dirty = " (uncommitted changes)" if git(path, "status", "--porcelain", check=False) else ""
+            out.append(f"  {path} on {br}{dirty}")
+    return "\n".join(out)
+
+
+def ship(repo, id_, msg_file, approved):
+    """Squash feature/<id> onto stage as ONE commit with the changelog as its message, push it, and clean up.
+    Refused unless the owner approved. Works in a throwaway worktree so the caller's checkouts are never touched."""
+    if not approved:
+        raise Fail("merging into stage needs the owner's yes: ask them (status needs_you, a 'Squash into stage' button), "
+                   "then run this with --owner-approved")
+    text = open(msg_file).read()
+    check_message(text)
+    feat = f"feature/{id_}"
+    if git(where(id_, "feature"), "status", "--porcelain", check=False):
+        raise Fail(f"the feature worktree has uncommitted changes: commit them on {feat} first")
+    git(repo, "fetch", "-q", "origin", "stage", check=False)
+    st = stage_ref(repo)
+    if not st:
+        raise Fail("this repo has no stage branch")
+    tmp = where(id_, "_ship")
+    shutil.rmtree(tmp, ignore_errors=True)
+    git(repo, "worktree", "prune")
+    git(repo, "worktree", "add", "-q", "--detach", tmp, st)
+    try:
+        r = subprocess.run(["git", "-C", tmp, "merge", "--squash", feat], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Fail(f"{feat} doesn't squash cleanly onto {st}: merge {st} into it first. {r.stdout.strip()[-400:]}")
+        if not git(tmp, "status", "--porcelain"):
+            raise Fail(f"{feat} has nothing that isn't on {st} already")
+        p = subprocess.run(["git", "-C", tmp, "commit", "-q", "--cleanup=verbatim", "-F", "-"], input=text.strip() + f"\n\nThread: {id_}\n",
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            raise Fail("commit: " + (p.stderr or p.stdout).strip()[-400:])
+        sha = git(tmp, "rev-parse", "--short", "HEAD")
+        if st == "origin/stage":
+            git(tmp, "push", "-q", "origin", "HEAD:stage")
+        git(repo, "branch", "-f", "stage", sha, check=False)  # fails when stage is checked out: it catches up on its next pull
+    finally:
+        git(repo, "worktree", "remove", "--force", tmp, check=False)
+    cleanup(repo, id_)
+    return f"shipped {feat} to stage as one commit {sha}: {text.strip().splitlines()[0]}"
+
+
+def cleanup(repo, id_):
+    """Remove a feature's worktrees, its branches (feature/<id> and feature/<id>--<role>) and its folder."""
+    for line in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
+        path = line.split("\n")[0].removeprefix("worktree ")
+        if path.startswith(os.path.join(ROOT, id_) + os.sep):
+            git(repo, "worktree", "remove", "--force", path, check=False)
+    for b in git(repo, "for-each-ref", "--format=%(refname:short)", f"refs/heads/feature/{id_}", f"refs/heads/feature/{id_}--*").split():
+        git(repo, "branch", "-D", b, check=False)
+    shutil.rmtree(os.path.join(ROOT, id_), ignore_errors=True)
+
+
+def main(argv):
+    """Dispatch the subcommand; returns the exit status (0 ok, 1 refused, 2 usage)."""
+    if len(argv) < 3 or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv[:1] in (["-h"], ["--help"]) else 2
+    cmd, repo, id_ = argv[0], os.path.expanduser(argv[1]), argv[2]
+    rest = argv[3:]
+    try:
+        if not SAFE.match(id_):
+            raise Fail(f"the id is the thread's id (lowercase, dashes): {id_!r}")
+        repo = git(repo, "rev-parse", "--show-toplevel")
+        if cmd == "start":
+            print(start(repo, id_, rest))
+        elif cmd == "sync" and len(rest) == 1:
+            print(sync(repo, id_, rest[0]))
+        elif cmd == "merge" and len(rest) == 1:
+            print(merge(repo, id_, rest[0]))
+        elif cmd == "status":
+            print(status(repo, id_))
+        elif cmd == "ship" and rest:
+            print(ship(repo, id_, rest[0], "--owner-approved" in rest[1:]))
+        else:
+            print(__doc__)
+            return 2
+    except Fail as e:
+        print("feature: " + str(e), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

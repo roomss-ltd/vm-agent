@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# guard-no-merge-hook: Claude Code PreToolUse hook (matcher: Bash). Autonomous panes (their "session:pane" listed
+# in ~/.config/vm-agent/muted-panes) may not merge PRs or push to stage/main/master: the owner merges themselves.
+# Exit 2 blocks the tool call and shows the reason to Claude; any other pane passes (exit 0).
+# Install in ~/.claude/settings.json under hooks.PreToolUse (matcher "Bash") as a command pointing at this file.
+input="$(cat)"
+who="${ZELLIJ_SESSION_NAME:-}:${ZELLIJ_PANE_ID:-}"
+grep -qxF "$who" "$HOME/.config/vm-agent/muted-panes" 2>/dev/null || exit 0
+cmd="$(printf '%s' "$input" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("tool_input") or {}).get("command",""))' 2>/dev/null)"
+if printf '%s' "$cmd" | grep -Eq 'gh +pr +merge|gh +api .*/merge|git +push[^|;&]*[ :](origin/)?(stage|main|master)( |$)|git +push[^|;&]*--force[^|;&]*(stage|main)'; then
+  echo "Blocked by the owner's guard rail: you may open and update PRs, but merging into stage/main or pushing to them needs their permission. Leave the PR open; JARVIS asks them." >&2
+  exit 2
+fi
+exit 0

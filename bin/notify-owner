@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# notify-owner: escalate to the owner on Telegram. ONLY for an impasse between you and your advisor model,
+# or a critical decision only the owner can make. Everything else: decide with the advisor.
+#   notify-owner "<what you need decided>" "<option A vs B, the advisor's view, what it blocks>"
+# Rate-limited to one message per pane per 2 hours; every message is logged for JARVIS in
+# ~/.local/state/vm-agent/escalations/log. Sends with `hermes send -t telegram`.
+set -euo pipefail
+ask="${1:-}"; detail="${2:-}"
+[ -n "${ask// }" ] && [ -n "${detail// }" ] || {
+  echo 'usage: notify-owner "<decision needed>" "<options, advisor view, what it blocks>"' >&2; exit 2; }
+who="${ZELLIJ_SESSION_NAME:-shell}:${ZELLIJ_PANE_ID:-?}"
+tab="$(basename "$PWD")"
+state="$HOME/.local/state/vm-agent/escalations"; mkdir -p "$state"
+stamp="$state/$(echo "$who" | tr ':' '-').last"
+now=$(date +%s)
+if [ -f "$stamp" ] && [ $((now - $(cat "$stamp"))) -lt 7200 ]; then
+  echo "Not sent: you escalated less than 2 h ago. Decide with the advisor, or fold this into OPEN-QUESTIONS.md under 'Needs the owner'; JARVIS reads it." >&2
+  exit 3
+fi
+msg="🚦 Decision needed — ${tab}
+${ask}
+
+${detail}
+
+(Reply here; JARVIS passes it to the agent.)"
+printf '%s\n--- %s %s\n%s\n' "" "$(date -u +%FT%TZ)" "$who" "$msg" >> "$state/log"
+hermes send -t telegram "$msg" >/dev/null
+echo "$now" > "$stamp"
+echo "Sent to the owner on Telegram. Keep working on everything this doesn't block; JARVIS will type their answer into this pane."

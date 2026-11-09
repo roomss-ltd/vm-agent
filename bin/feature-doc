@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""feature-doc: read and write your feature's record (PLAN.md, TESTS.md, LOG.md) through the control panel.
+
+Every write carries the revision you read, so two agents (or an agent and the owner's page) never overwrite each
+other: a stale write is refused, the file untouched, and you read again and redo your change.
+
+  feature-doc show                       the feature: paths, revisions, every step (key, state, owner, why, runAs)
+  feature-doc get plan [-o FILE]         the text (plan, tests, log, feature, draft) to FILE or stdout; "rev <rev>" on stderr
+  feature-doc put plan FILE --rev REV    write FILE as PLAN.md (or TESTS.md) if it is still at REV ("-" reads stdin)
+  feature-doc log "Builder: step 2 done" append a dated line to LOG.md (the panel dates it; nothing is rewritten)
+  feature-doc evidence KEY KIND REF [--covers D1] [--result TEXT]
+                                         put proof under step KEY: "- evidence: KIND REF" (run|file|image|doc|db|link|ui|log)
+  feature-doc log "…" [--ran-json JSON] [--next T] [--objectives D1,D2] [--pr N] [--proof KEY]
+                                         the same line with authored segments: only what you pass (ran is a claim)
+  feature-doc artifact KEY PATH --purpose ui|issue --title T
+                                         link a visual artifact to step KEY: "- artifact: PATH | ui|issue | T"
+  feature-doc assess KEY pass|fail|insufficient --reasons TEXT --cites REF[,REF]
+                                         a judgement of KEY's evidence ("- assessment: …"): never verifies or accepts
+
+FEATURE.md is the owner's: propose changes as a draft (put draft: FEATURE.draft.md, promoted only by the owner) or in LOG.md. A step with an owner-approved check shows its runAs: run that
+exact string with your Bash tool, unchanged, then tick the step with "- evidence: run <attempt>" (and "- result: <text
+from that run's output>"). Any other evidence stays "claimed" until a receipt or the owner verifies it; the panel
+records which session wrote it (this Claude session's id, sent as X-Agent-Sid: who claims it, not proof of who).
+
+The feature is your zellij session's ($ZELLIJ_SESSION_NAME); --session names another. Exit 2: stale or conflicting
+(read again and redo), 1: any other error.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PANEL = os.environ.get("PANEL_AGENT_URL", "http://127.0.0.1:7778")
+TOKEN = os.path.expanduser(os.environ.get("PANEL_AGENT_TOKEN_FILE", "~/.config/control-panel/agent-token"))
+OPEN = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback: never through a proxy
+
+
+class Refused(Exception):
+    """The panel (or a local check) refused the request: code is the HTTP status (0 for a local refusal), rev the
+    current revision the panel reported on a stale write."""
+
+    def __init__(self, code, msg, rev=""):
+        super().__init__(msg)
+        self.code, self.rev = code, rev
+
+
+def call(method, path, body=None):
+    """One request to the panel's loopback agent API with the bearer token; returns the decoded JSON or raises Refused."""
+    with open(TOKEN) as f:
+        tok = f.read().strip()
+    req = urllib.request.Request(PANEL + path, method=method, headers={"Authorization": "Bearer " + tok})
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):  # attribution, a claim under the shared bearer: never authority
+        req.add_header("X-Agent-Sid", os.environ["CLAUDE_CODE_SESSION_ID"])
+    if body is not None:
+        req.data = json.dumps(body).encode()
+        req.add_header("Content-Type", "application/json")
+    try:
+        with OPEN.open(req, timeout=30) as r:
+            return json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        try:
+            b = json.loads(e.read())
+        except ValueError:
+            b = {}
+        raise Refused(e.code, b.get("error") or e.reason, b.get("rev", "")) from None
+    except urllib.error.URLError as e:
+        raise Refused(0, f"control panel not reachable at {PANEL} ({e.reason})") from None
+
+
+def dossier(session):
+    """The feature record of a zellij session as the panel serves it: documents, revisions, milestones and steps."""
+    return call("GET", "/agent/feature?" + urllib.parse.urlencode({"session": session}))["dossier"]
+
+
+def put(session, doc, text, rev):
+    """Write a document (plan, tests or draft) if it is still at rev; a stale rev is refused with HTTP 409."""
+    return call("POST", "/agent/feature/doc", {"session": session, "doc": doc, "text": text, "rev": rev})
+
+
+STEP = re.compile(r"^(\s*)- \[(.)\] (.*)$")
+
+
+def step_text(line, owner=""):
+    """A plan line's step text without its owner tag: the panel's owner can be several words ("@Hermes integration")."""
+    line = line.strip()
+    if owner and line.endswith(" @" + owner):
+        return line[: -len(owner) - 2].strip()
+    return re.sub(r"\s+@\S+$", "", line).strip()
+
+
+def edit_step(session, key, edit):
+    """Change step KEY's sub-lines in PLAN.md with edit(lines, at, ind, end), written against the rev just read.
+    This is the same step lookup as vm_mcp's _edit_step: both are small and stdlib-only, and sharing one module
+    would need a path hack."""
+    d = dossier(session)
+    hit = next(((ms.get("title", ""), s) for ms in d.get("milestones") or [] for s in ms.get("steps") or [] if s.get("key") == key), None)
+    if hit is None:
+        raise Refused(0, f"no step with key {key} (feature-doc show lists them)")
+    lines, ms, at = (d.get("plan") or "").split("\n"), "", -1
+    for n, ln in enumerate(lines):
+        if ln.strip().startswith("## "):
+            ms = ln.strip()[3:].strip()
+        elif (m := STEP.match(ln)) and ms == hit[0] and step_text(m.group(3), hit[1].get("owner", "")) == hit[1].get("text"):
+            at = n
+            break
+    if at < 0:
+        raise Refused(0, f"step {key} isn't in PLAN.md's text any more: read it again")
+    ind, end = STEP.match(lines[at]).group(1) + "  ", at + 1
+    while end < len(lines) and re.match(r"^\s+- [a-z-]+:", lines[end]):
+        end += 1
+    edit(lines, at, ind, end)
+    return put(session, "plan", "\n".join(lines), d["revs"]["plan"])["rev"]
+
+
+def one(x):
+    """x on one line, with runs of whitespace collapsed."""
+    return " ".join(x.split())
+
+
+def evidence(session, a):
+    """The step's sub-lines get "- evidence: KIND REF" (and "- result:"; --covers merges into "- covers:")."""
+    if "\n" in a.ref or not a.ref.strip():
+        raise Refused(0, "a bad ref: one path, attempt or link")
+
+    def edit(lines, at, ind, end):
+        # "log" is a file on the panel: written as file, the purpose kept in the result line (as vm_mcp add_evidence)
+        kind, res = ("file", "log" + (f": {one(a.result)}" if a.result.strip() else "")) if a.kind == "log" else (a.kind, one(a.result))
+        lines[end:end] = [f"{ind}- evidence: {kind} {a.ref.strip()}"] + ([f"{ind}- result: {res}"] if res else [])
+        ids = [x.strip() for x in a.covers.split(",") if x.strip()]
+        if ids:  # the step's canonical "- covers: D1, D2" line, merged; never words on the evidence line
+            have = next((k for k in range(at + 1, end) if lines[k].strip().startswith("- covers:")), None)
+            old = [x.strip() for x in lines[have].split(":", 1)[1].split(",") if x.strip()] if have is not None else []
+            merged = ind + "- covers: " + ", ".join(old + [x for x in ids if x not in old])
+            if have is None:
+                lines.insert(at + 1, merged)
+            else:
+                lines[have] = merged
+    return edit_step(session, a.key, edit)
+
+
+def assess(session, a):
+    """A judgement of the step's evidence: "- assessment: VERDICT — reasons — cites refs" (as vm_mcp add_assessment).
+    It verifies nothing and accepts nothing, whoever writes it; the X-Agent-Sid sent is a claim of who."""
+    if not a.reasons.strip() or not a.cites.strip():
+        raise Refused(0, "an assessment needs its reasons (--reasons) and the evidence it cites (--cites)")
+    line = f"- assessment: {a.verdict} — {one(a.reasons)} — cites {one(a.cites)}"
+    return edit_step(session, a.key, lambda lines, at, ind, end: lines.insert(end, ind + line))
+
+
+LOG_MAX, ART_TITLE_MAX = 2000, 200  # the longest LOG line and artifact title this client sends
+ESC = {"%": "%25", "|": "%7C", ";": "%3B", ",": "%2C", "=": "%3D", "\n": "%0A", "\t": "%09", "\r": "%0D", " ": "%20"}
+
+
+def esc(x):
+    """ran/next values kept exactly (as vm_mcp _esc): % | ; , = newline tab CR escaped, a space too unless it's a lone
+    space between words; one pass; other whitespace or control characters refused. The panel decodes exactly these."""
+    x = str(x)
+    if any(c not in ESC and (c.isspace() or ord(c) < 32 or ord(c) == 127) for c in x):
+        raise Refused(0, "a command or --next holds characters the log can't keep exactly (a control or unusual space)")
+    return "".join(c if (c == " " and 0 < i < len(x) - 1 and x[i - 1] != " " and x[i + 1] != " ") or c not in ESC else ESC[c]
+                   for i, c in enumerate(x))
+
+
+def log_line(a):
+    """The LOG line: your text as given, plus only the authored segments you passed (as vm_mcp report_feature_progress).
+    Over LOG_MAX characters it is refused, never cut."""
+    seg = [a.line]  # as given, exactly as before
+    if a.ran_json:
+        try:
+            ran = json.loads(a.ran_json)
+        except ValueError as e:
+            raise Refused(0, f"--ran-json: not JSON ({e})") from None
+        if not isinstance(ran, list) or not all(isinstance(r, dict) and str(r.get("cmd", "")).strip() and r.get("ok") in (True, False, None) for r in ran):
+            raise Refused(0, '--ran-json: a list of {"cmd", "result", "ok": true|false} (ok left out: unknown)')
+        if ran:
+            seg.append("ran: " + "; ".join(f"ok={'?' if r.get('ok') is None else 1 if r['ok'] else 0},cmd={esc(r['cmd'])},result={esc(r.get('result', ''))}" for r in ran))
+    if a.next.strip():
+        seg.append("next: " + esc(a.next))
+    ids = [x.strip() for x in a.objectives.split(",") if x.strip()]
+    if any(not re.fullmatch(r"D\d+", i) for i in ids):
+        raise Refused(0, "--objectives: FEATURE.md ids, D1,D2")
+    if ids:
+        seg.append("objectives: " + ",".join(ids))
+    if a.pr:
+        if a.pr < 1:
+            raise Refused(0, "--pr: a PR number")
+        seg.append(f"pr: {a.pr}")
+    if one(a.proof):
+        seg.append("proof: " + one(a.proof).replace("|", "/"))
+    line = " | ".join(seg)
+    if len(line) > LOG_MAX:
+        raise Refused(0, f"the line is {len(line)} characters, over {LOG_MAX}: say less or split it (nothing was written)")
+    return line
+
+
+def artifact(session, a):
+    """The step's sub-line "- artifact: PATH | ui|issue | TITLE" (as vm_mcp link_artifact): shown, never evidence."""
+    p, t = a.path, one(a.title)
+    if not p.strip() or p != p.strip() or "|" in p or any(ord(c) < 32 or ord(c) == 127 for c in p):
+        raise Refused(0, "PATH: one path, no '|', no newline or control character, no edge spaces")
+    if not t or "|" in t or len(t) > ART_TITLE_MAX:
+        raise Refused(0, f"--title: one line, no '|', at most {ART_TITLE_MAX} characters")
+    new = f"- artifact: {p} | {a.purpose} | {t}"
+
+    def edit(lines, at, ind, end):
+        if not any(lines[k].strip() == new for k in range(at + 1, end)):
+            lines[end:end] = [ind + new]
+    return edit_step(session, a.key, edit)
+
+
+def show(d):
+    """The record as text: revisions, conflicts, and every step with its state, owner and the approved runAs command."""
+    out = [f"record {d.get('dir', '')}" + (f" (thread {d['thread']})" if d.get("thread") else ""),
+           "revs " + " ".join(f"{k}={v}" for k, v in sorted((d.get("revs") or {}).items()))]
+    out += [f"CONFLICT {c}" for c in d.get("conflicts") or []]
+    for m in d.get("milestones") or []:
+        out.append(f"## {m['title']}")
+        for s in m.get("steps") or []:
+            line = f"  [{s.get('state')}] {s.get('text')}" + (f" @{s['owner']}" if s.get("owner") else "") + f"  key={s.get('key', '')}"
+            for k in ("label", "why", "blocked", "ask", "attempt"):
+                if s.get(k):
+                    line += f"\n      {k}: {s[k]}"
+            if s.get("runAs"):  # verbatim from the panel: the verifier matches this exact string
+                line += f"\n      runAs: {s['runAs']}"
+            out.append(line)
+    return "\n".join(out)
+
+
+def main(argv=None):
+    """Command-line entry point. Returns the exit status: 0 ok, 2 stale or conflicting write, 3 logged without an event, 1 other."""
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0], epilog=__doc__.split("\n", 2)[2],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--session", default=os.environ.get("ZELLIJ_SESSION_NAME", ""))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("show")
+    g = sub.add_parser("get")
+    g.add_argument("doc", choices=["plan", "tests", "log", "feature", "draft"])
+    g.add_argument("-o", "--out")
+    p = sub.add_parser("put")
+    p.add_argument("doc", choices=["plan", "tests", "draft"])  # FEATURE.md is the owner's (draft: FEATURE.draft.md, a proposal); LOG.md only grows
+    p.add_argument("file")
+    p.add_argument("--rev", required=True)
+    lg = sub.add_parser("log")
+    lg.add_argument("line")
+    lg.add_argument("--ran-json", default="", help='commands you ran: [{"cmd", "result", "ok"}], written exactly; a claim, never a receipt')
+    lg.add_argument("--next", default="", help="the next step you will take")
+    lg.add_argument("--objectives", default="", help="FEATURE.md ids it serves: D1,D2")
+    lg.add_argument("--pr", type=int, default=0)
+    lg.add_argument("--proof", default="", help="the step key whose proof this concerns")
+    ar = sub.add_parser("artifact")
+    ar.add_argument("key")
+    ar.add_argument("path")
+    ar.add_argument("--purpose", choices=["ui", "issue"], required=True)
+    ar.add_argument("--title", required=True)
+    ev = sub.add_parser("evidence")
+    ev.add_argument("key")
+    ev.add_argument("kind", choices=["run", "file", "image", "doc", "db", "link", "ui", "log"])
+    ev.add_argument("ref")
+    ev.add_argument("--covers", default="")
+    ev.add_argument("--result", default="")
+    asx = sub.add_parser("assess")
+    asx.add_argument("key")
+    asx.add_argument("verdict", choices=["pass", "fail", "insufficient"])
+    asx.add_argument("--reasons", required=True)
+    asx.add_argument("--cites", required=True)
+    a = ap.parse_args(argv)
+    if not a.session:
+        ap.error("no feature: not in a zellij session, and no --session")
+    try:
+        if a.cmd == "show":
+            print(show(dossier(a.session)))
+        elif a.cmd == "get":
+            d = dossier(a.session)
+            text = d.get(a.doc) or ""
+            if a.out:
+                with open(a.out, "w") as f:
+                    f.write(text)
+            else:
+                sys.stdout.write(text)
+            print(f"rev {(d.get('revs') or {}).get(a.doc, '')}", file=sys.stderr)
+        elif a.cmd == "put":
+            text = sys.stdin.read() if a.file == "-" else open(a.file).read()
+            print(f"written; rev {put(a.session, a.doc, text, a.rev)['rev']}")
+        elif a.cmd == "assess":
+            print(f"assessment recorded; plan rev {assess(a.session, a)}. A judgement: it verifies and accepts nothing.")
+        elif a.cmd == "artifact":
+            print(f"artifact linked; plan rev {artifact(a.session, a)}. Shown on the page, never evidence.")
+        elif a.cmd == "evidence":
+            print(f"evidence added; plan rev {evidence(a.session, a)}. It stays claimed until a receipt or the owner verifies it.")
+        else:  # append-only on the panel: no revision, never a rewrite of LOG.md
+            r = call("POST", "/agent/feature/log", {"session": a.session, "line": log_line(a)}) or {}
+            if r.get("warning"):  # in LOG.md, but no event: the page can't show it as seen or reviewed
+                print(f"WARNING: {r['warning']} (the line is in LOG.md; it has no event on the page)", file=sys.stderr)
+                return 3
+            print(f"logged ({r['id']})" if r.get("id") else "logged")
+    except Refused as e:
+        msg = f"refused ({e.code}): {e}" if e.code else str(e)
+        if e.code == 409:
+            msg += f"\nRead it again (feature-doc get …{', now at rev ' + e.rev if e.rev else ''}), redo your change on that text, put it with the new rev."
+        print(msg, file=sys.stderr)
+        return 2 if e.code == 409 else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

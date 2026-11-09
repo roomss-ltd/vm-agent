@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# fable-advise: ask Fable 5.1 (Anthropic's strongest model) for advice on a decision, print its answer.
+#   fable-advise "Should I nudge X or let it run? Context: ..."
+#   some-context | fable-advise "Given this, what should JARVIS do?"
+# Runs through teamclaude (a `claude` launcher with an account pool; it must be on PATH, or replace it with plain
+# `claude` below), read-only: no tools, so it can only think and answer. FABLE_TIMEOUT (seconds, default 600) caps a run.
+set -euo pipefail
+q="${1:-}"
+if [ ! -t 0 ]; then ctx="$(cat)"; q="${q}
+
+Context:
+${ctx}"; fi
+[ -n "${q// }" ] || { echo "usage: fable-advise \"question\" [< context]" >&2; exit 2; }
+cd "${TMPDIR:-/tmp}"
+exec timeout "${FABLE_TIMEOUT:-600}" teamclaude run -p --model claude-fable-5-1 --tools "" \
+  --append-system-prompt "You are the advisor to JARVIS, the owner's chief-of-staff agent. Give a clear recommendation first, then the 2-4 reasons that matter, then risks. Be concise and concrete. Prefer clean code; nothing to prod/main without the owner's OK." \
+  "$q"

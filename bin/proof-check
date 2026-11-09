@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""proof-check: will this PROOF.html show its pictures in the owner's control panel?
+
+The panel renders HTML artefacts sandboxed: only data:/https: images load, so relative or file paths show
+as broken pictures; and it serves at most 25 MB, so a bigger file is cut off. This checks every <img>
+(and CSS url()) is an embedded, decodable data: image, and that the file is small enough.
+
+  proof-check PROOF.html            report; exit 1 if anything would not render
+  proof-check --embed PROOF.html    rewrite it in place: inline every local image as a JPEG data: URI
+                                    (max 1600 px wide, quality 80), then re-check
+
+Pillow is optional: without it --embed inlines each image's original bytes instead of re-encoding it as a
+smaller JPEG, so a large page may still fail the size check. Python 3, standard library only.
+"""
+import base64, io, os, re, sys
+
+LIMIT = 15 << 20  # leave headroom under the panel's 25 MB cap
+IMG = re.compile(r'(<img\b[^>]*?\bsrc\s*=\s*)(["\'])(.*?)\2', re.I | re.S)
+CSSURL = re.compile(r'url\(\s*(["\']?)(?!data:|https:)([^)"\']+)\1\s*\)', re.I)
+
+
+def to_jpeg_data_uri(path):
+    """The image at path as a data: URI: re-encoded as a JPEG (<= 1600 px wide) when Pillow is installed, else as is."""
+    try:
+        from PIL import Image
+    except ImportError:
+        mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+        return f"data:{mime};base64," + base64.b64encode(open(path, "rb").read()).decode()
+    im = Image.open(path).convert("RGB")
+    if im.width > 1600:
+        im = im.resize((1600, round(im.height * 1600 / im.width)))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=80, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def resolve(src, base):
+    """The file an <img src> points at: a file:// URL or a path, relative paths taken from the HTML file's folder."""
+    p = src[7:] if src.startswith("file://") else src
+    return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
+
+
+def embed(path):
+    """Rewrite the HTML file in place, replacing every local <img src> with an embedded data: URI."""
+    base = os.path.dirname(os.path.abspath(path))
+    html = open(path, encoding="utf-8", errors="replace").read()
+
+    def sub(m):  # one <img src=...> match: leave data:/https: and missing files alone
+        src = m.group(3)
+        if src.startswith(("data:", "https:")):
+            return m.group(0)
+        f = resolve(src, base)
+        if not os.path.exists(f):
+            print(f"  missing, left as is: {src}")
+            return m.group(0)
+        return f'{m.group(1)}"{to_jpeg_data_uri(f)}"'
+
+    html = IMG.sub(sub, html)
+    open(path, "w", encoding="utf-8").write(html)
+
+
+def check(path):
+    """Print a verdict for one HTML file and return True when every picture in it will render in the panel."""
+    html = open(path, encoding="utf-8", errors="replace").read()
+    size = os.path.getsize(path)
+    srcs = [m.group(3) for m in IMG.finditer(html)]
+    bad = []
+    for s in srcs:
+        if s.startswith("https:"):
+            continue
+        if not s.startswith("data:image/"):
+            bad.append(f"not embedded: {s[:90]}")
+            continue
+        try:
+            head = base64.b64decode(s.split(",", 1)[1][:400] + "==", validate=False)
+            if not (head[:3] == b"\xff\xd8\xff" or head[:8] == b"\x89PNG\r\n\x1a\n" or head[:4] == b"RIFF" or head[:3] == b"GIF"):
+                bad.append("data: image that doesn't decode as JPEG/PNG/WebP/GIF")
+        except Exception as e:  # noqa: BLE001
+            bad.append(f"broken base64: {e}")
+    for m in CSSURL.finditer(html):
+        bad.append(f"CSS url() not embedded: {m.group(2)[:90]}")
+    if size > LIMIT:
+        bad.append(f"file is {size / 2**20:.1f} MB; keep it under {LIMIT >> 20} MB (JPEG q80, <=1600 px wide)")
+    if not srcs:
+        bad.append("no <img> at all: a proof needs screenshots")
+    print(f"{path}: {len(srcs)} images, {size / 2**20:.1f} MB -> {'OK' if not bad else 'WILL NOT RENDER'}")
+    for b in bad:
+        print("  - " + b)
+    return not bad
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(2)
+    if args[0] == "--embed":
+        for p in args[1:]:
+            embed(p)
+        args = args[1:]
+    sys.exit(0 if all([check(p) for p in args]) else 1)

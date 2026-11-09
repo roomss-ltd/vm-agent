@@ -1,0 +1,20 @@
+{
+  "name": "jarvis-attachments",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@message-ui/cli": "^0.1.0",
+    "@message-ui/components": "^0.1.0",
+    "@message-ui/render": "^0.1.0",
+    "@message-ui/tailwind": "^0.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tsx": "^4.23.15"
+  },
+  "scripts": {
+    "render": "tsx render.tsx",
+    "list": "tsx render.tsx --list",
+    "dev": "message-ui dev --dir ./cards --port 3007",
+    "export": "message-ui export --dir ./cards --out ./out"
+  }
+}

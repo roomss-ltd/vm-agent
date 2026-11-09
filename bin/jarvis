@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""jarvis: a message from a terminal (a Claude Code agent, or you) to JARVIS, the owner's Hermes assistant.
+
+  jarvis "PR #212 is green and ready for review"        waits for JARVIS's answer and prints it
+  jarvis --no-wait "nightly import done: 1,204 rows"    sends it and returns at once
+  some-report | jarvis -                                 the message from stdin
+
+In a thread's team (the zellij session a product lead JARVIS runs) the message goes to that lead instead, and it
+answers in the pane. Anywhere else, each zellij pane has its own conversation with JARVIS (Hermes session agent-<session>-<pane>), so it remembers
+what that pane told it, and the owner sees all of it in the control panel's J.A.R.V.I.S chat. JARVIS knows which
+pane wrote and can write back into it (as a message starting with "[From JARVIS]"). When an answer takes longer
+than --wait seconds this returns, and the answer is typed into this pane once it's there.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HERMES = os.environ.get("JARVIS_URL", "http://127.0.0.1:8642")
+PANEL = os.environ.get("PANEL_AGENT_URL", "http://127.0.0.1:7778")
+KEY = os.path.expanduser("~/.config/vm-agent/api-key")
+PANEL_TOKEN = os.path.expanduser("~/.config/control-panel/agent-token")
+REPLIES = os.path.expanduser("~/.local/state/vm-agent/agent-replies")
+OPEN = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback: never the agents' HTTPS proxy
+
+
+def post(url, token, body, timeout):
+    """POST body as JSON with a bearer token; returns (HTTP status, decoded JSON answer or {} when it isn't JSON)."""
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with OPEN.open(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except ValueError:
+            return e.code, {}
+
+
+def secret(path):
+    """The contents of a small secret file (an API key or token), without surrounding whitespace."""
+    with open(path) as f:
+        return f.read().strip()
+
+
+def where():
+    """("box-dev", "5") inside a zellij pane, else (None, None)."""
+    return os.environ.get("ZELLIJ_SESSION_NAME"), os.environ.get("ZELLIJ_PANE_ID")
+
+
+def converse(session_id, title, text, author):
+    """One turn with JARVIS in this pane's conversation: (answer, error)."""
+    key = secret(KEY)
+    code, body = post(f"{HERMES}/api/sessions", key, {"id": session_id, "title": title}, 30)
+    if code not in (200, 201, 409):  # 409: the conversation exists already
+        return None, f"JARVIS couldn't open the conversation ({code}): {json.dumps(body)[:300]}"
+    code, body = post(f"{HERMES}/api/sessions/{session_id}/chat", key, {"message": text, "author": author}, 3600)
+    if code != 200:
+        return None, f"JARVIS didn't take it ({code}): {json.dumps(body)[:300]}"
+    return ((body.get("message") or {}).get("content") or "").strip(), None
+
+
+MUTED = os.path.expanduser("~/.config/vm-agent/muted-panes")  # "session:pane" per line: autonomous agents
+OUTBOX = os.path.expanduser("~/.local/state/vm-agent/muted-outbox")  # what muted panes wrote; JARVIS reads it on its check-ins
+UNSENT = os.path.expanduser("~/.local/state/vm-agent/unsent")  # a message jarvis refused to guess a route for
+
+
+def muted(address):
+    """True when "session:pane" is listed in the muted-panes file (an autonomous agent that must not ping the owner)."""
+    try:
+        with open(MUTED) as f:
+            return address in {line.split("#")[0].strip() for line in f}
+    except FileNotFoundError:
+        return False
+
+
+def park(session, pane, msg):
+    """An autonomous agent's message: logged for JARVIS's next check-in, never posted to the owner's chat."""
+    os.makedirs(OUTBOX, exist_ok=True)
+    with open(os.path.join(OUTBOX, f"{session}-{pane}.log"), "a") as f:
+        f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} cwd={os.getcwd()}\n{msg.strip()}\n")
+    print("Not sent: this pane works autonomously. Your note is logged for JARVIS's next check-in; nobody will "
+          "answer it now. Don't wait. Decide yourself: consult your advisor model on hard calls, follow your "
+          "PLAN.md, record the decision in OPEN-QUESTIONS.md/LEARNINGS.md, keep going.")
+    return 0
+
+
+def thread_of(session):
+    """(thread id or None, error): the thread whose team works in this zellij session (the control panel's threads).
+    error: the panel couldn't say (unreachable, an error, a bad answer), which is not the same as "no thread"."""
+    req = urllib.request.Request(f"{PANEL}/agent/threads", headers={"Authorization": "Bearer " + secret(PANEL_TOKEN)})
+    last = ""
+    for attempt in range(3):  # a panel restarting or briefly failing: a few quick tries before giving up
+        try:
+            with OPEN.open(req, timeout=10) as r:
+                ts = json.loads(r.read()).get("threads") or []
+            return next((t["id"] for t in ts if t.get("team") == session and t.get("status") != "archived"), None), ""
+        except urllib.error.HTTPError as e:
+            last = f"the panel answered {e.code}"
+        except (OSError, ValueError) as e:
+            last = f"{type(e).__name__}: {e}"
+        time.sleep(1 + attempt)
+    return None, last
+
+
+def type_into_pane(session, pane, text):
+    """Type text plus Enter into a zellij pane through the control panel (how a late answer reaches the agent)."""
+    post(f"{PANEL}/agent/pane/input", secret(PANEL_TOKEN), {"session": session, "pane": int(pane), "text": text, "enter": True}, 30)
+
+
+def main():
+    """Parse the command line, route the message (park, to a thread's lead, or to Main JARVIS) and print the outcome."""
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0], epilog=__doc__.split("\n", 2)[2],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("message", nargs="?", help='what to tell or ask JARVIS ("-": read it from stdin)')
+    ap.add_argument("--resend", metavar="FILE", help="send again a report jarvis saved as Not sent; only from the pane that wrote it")
+    ap.add_argument("--no-wait", action="store_true", help="send it and return; JARVIS's answer stays in its chat")
+    ap.add_argument("--wait", type=float, default=90, help="seconds to wait for the answer here (default 90)")
+    a = ap.parse_args()
+    zs, zp = where()
+    resend = a.resend
+    if resend:  # the saved report keeps its routing identity: it goes only from the session and pane that wrote it
+        try:
+            with open(resend) as f:
+                saved = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"can't read {resend}: {e}", file=sys.stderr)
+            return 1
+        if (saved.get("session"), saved.get("pane")) != (zs, zp):
+            print(f"Not sent: this report was written in {saved.get('session')}:{saved.get('pane')}, and this is "
+                  f"{zs or '(no zellij session)'}:{zp or '-'}. Resend it from that pane, so it reaches that pane's lead as "
+                  "that pane's report.", file=sys.stderr)
+            return 1
+        msg = saved.get("message", "")
+    else:
+        msg = sys.stdin.read() if a.message == "-" else (a.message or "")
+    if not msg.strip():
+        ap.error("an empty message")
+    sent = lambda: resend and os.path.exists(resend) and os.remove(resend)  # noqa: E731 - delivered: the copy goes
+    if zs and zp and muted(f"{zs}:{zp}"):
+        return park(zs, zp, msg)
+    lead, err = thread_of(zs) if zs and zp else (None, "")
+    if err:  # don't guess: a team member's news sent to Main instead of its lead is lost to the lead
+        # Known limit: a bounded retry (3 quick tries) then a saved copy, not durable delivery; resending is the caller's job.
+        path = resend
+        if not path:  # saved with who wrote it, so a resend can't go out under another pane's identity
+            os.makedirs(UNSENT, mode=0o700, exist_ok=True)
+            path = os.path.join(UNSENT, f"{zs}-{zp}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"session": zs, "pane": zp, "cwd": os.getcwd(), "message": msg}, f)
+        print(f"Not sent: couldn't ask the control panel which thread leads {zs} ({err}), after a bounded retry. "
+              f"Nothing was delivered. Your message is saved in {path}; send it again later FROM THIS PANE "
+              f"({zs}:{zp}) with: jarvis --resend {path}", file=sys.stderr)
+        return 1
+    if lead:  # a thread's team: the message goes to its lead, who answers in this pane
+        code, body = post(f"{PANEL}/agent/thread/send", secret(PANEL_TOKEN),
+                          {"id": lead, "text": f"(working in {os.getcwd()})\n{msg.strip()}", "from": f"agent:{zs}:{zp}"}, 60)
+        if code != 200:
+            print(f"Your lead (thread {lead}) didn't get it ({code}): {json.dumps(body)[:300]}", file=sys.stderr)
+            return 1
+        sent()
+        print(f"Sent to your lead (thread {lead}). It answers in this pane, as a message starting with \"[From your lead]\"; "
+              "don't wait for it, carry on with what you can.")
+        return 0
+    name = f"{zs}:{zp}" if zs and zp else "a terminal outside zellij"
+    session_id = "agent-" + re.sub(r"[^A-Za-z0-9_.-]", "-", f"{zs}-{zp}" if zs and zp else "shell")
+    text = f"[From the Claude agent in {name}, working in {os.getcwd()}]\n{msg.strip()}"
+    author = {"id": f"agent:{name}", "name": f"Claude agent {name}", "is_bot": True}
+
+    os.makedirs(REPLIES, exist_ok=True)
+    stamp = f"{session_id}-{time.time_ns()}"
+    result, gave_up = os.path.join(REPLIES, stamp + ".json"), os.path.join(REPLIES, stamp + ".gone")
+    if os.fork():  # the parent waits; a detached child holds the turn, so it finishes whatever happens here
+        sent()
+        if a.no_wait:
+            print(f"Sent to JARVIS (conversation {session_id}).")
+            return 0
+        deadline = time.time() + a.wait
+        while time.time() < deadline and not os.path.exists(result):
+            time.sleep(0.5)
+        if not os.path.exists(result):
+            open(gave_up, "w").close()
+            if not os.path.exists(result):
+                print("JARVIS is still working on it. Its answer will be typed into this pane when it's ready, "
+                      'as a message starting with "[From JARVIS]".' if zs else "JARVIS is still working on it; "
+                      "its answer will be in the control panel's chat.")
+                return 0
+        with open(result) as f:
+            r = json.load(f)
+        os.remove(result)
+        if r.get("error"):
+            print(r["error"], file=sys.stderr)
+            return 1
+        print(r["answer"] or "(JARVIS answered with nothing)")
+        return 0
+
+    os.setsid()
+    for fd in (0, 1, 2):  # the caller's terminal is no business of the child's
+        os.dup2(os.open(os.devnull, os.O_RDWR), fd)
+    try:
+        answer, err = converse(session_id, f"Claude agent {name}", text, author)
+    except Exception as e:  # noqa: BLE001 - whatever it was, the caller hears it
+        answer, err = None, f"JARVIS isn't reachable: {e}"
+    with open(result + ".tmp", "w") as f:
+        json.dump({"answer": answer, "error": err}, f)
+    os.replace(result + ".tmp", result)
+    late = os.path.exists(gave_up)
+    if late and zs and zp:  # the caller stopped waiting: the answer comes to its pane
+        type_into_pane(zs, zp, "[From JARVIS] " + (answer or f"(no answer: {err})")[:8000])
+    if late or a.no_wait:
+        for p in (result, gave_up):
+            if os.path.exists(p):
+                os.remove(p)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
